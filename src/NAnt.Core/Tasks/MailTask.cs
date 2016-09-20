@@ -127,6 +127,7 @@ namespace NAnt.Core.Tasks {
         private string _message = "";
         private string _userName = "";
         private string _passWord = "";
+        private bool _useDefaultCredentials = false;
         private bool _isBodyHtml = false;
         private bool _enableSsl = false;
         private int _portNumber = 25;
@@ -268,6 +269,18 @@ namespace NAnt.Core.Tasks {
         }
 
         /// <summary>
+        /// Set usedefaultcredentials=true to use the default credentials of the system 
+        /// user when connecting to the smtp host.
+        /// Otherwise use connect anonymous if username or password is not set
+        /// </summary>
+        [TaskAttribute("usedefaultcredentials")]
+        public bool UseDefaultCredentials
+        {
+            get { return _useDefaultCredentials; }
+            set { _useDefaultCredentials = value; }
+        }
+
+        /// <summary>
         /// Format of the message. The default is <see cref="MailFormat.Text" />.
         /// </summary>
         [TaskAttribute("format")]
@@ -300,7 +313,7 @@ namespace NAnt.Core.Tasks {
                         IsBodyHtml = false;
                     }
                 }
-            } 
+            }
         }
 
         /// <summary>
@@ -464,7 +477,7 @@ namespace NAnt.Core.Tasks {
                     smtp.Credentials =
                         new NetworkCredential(this.UserName, this.Password);
                 }
-                else
+                else if (this.UseDefaultCredentials)
                 {
                     // Mono does not implement the UseDefaultCredentials
                     // property in the SmtpClient class.  So only set the
