@@ -87,6 +87,7 @@ namespace NAnt.Core.Tasks {
         private FileInfo _destFile;
         private string _httpProxy;
         private Proxy _proxy;
+        private int _retries = 5;
         private int _timeout = 100000;
         private bool _useTimeStamp;
         private Credential _credentials;
@@ -169,6 +170,18 @@ namespace NAnt.Core.Tasks {
         }
 
         /// <summary>
+        /// The number of retries, until the request fails.
+        /// The default is <c>5</c> milliseconds.
+        /// </summary>
+        [TaskAttribute("retries")]
+        [Int32Validator()]
+        public int Retries
+        {
+            get { return _retries; }
+            set { _retries = value; }
+        }
+
+        /// <summary>
         /// The length of time, in milliseconds, until the request times out.
         /// The default is <c>100000</c> milliseconds.
         /// </summary>
@@ -206,6 +219,87 @@ namespace NAnt.Core.Tasks {
             }
         }
 
+        private Stream GetResponseStream(WebResponse webResponse)
+        {
+            // Get stream
+            // try three times, then error out
+            int tryCount = 1;
+            Stream responseStream;
+
+            while (true)
+            {
+                try
+                {
+                    responseStream = webResponse.GetResponseStream();
+                    break;
+                }
+                catch (IOException ex)
+                {
+                    if (tryCount > 3)
+                    {
+                        throw new BuildException(string.Format(CultureInfo.InvariantCulture,
+                            ResourceUtils.GetString("NA1125"), Source,
+                            DestinationFile.FullName), Location);
+                    }
+                    else
+                    {
+                        Log(Level.Warning, "Unable to open connection to '{0}' (try {1} of 3): " + ex.Message, Source, tryCount);
+                    }
+                }
+
+                // increment try count
+                tryCount++;
+            }
+            return responseStream;
+        }
+
+        private int CopyStream(Stream responseStream, BinaryWriter destWriter)
+        {
+            Log(Level.Info, "Retrieving '{0}' to '{1}'.",
+                    Source, DestinationFile.FullName);
+
+            // Read in stream from URL and write data in chunks
+            // to the dest file.
+            int bufferSize = 100 * 1024;
+            byte[] buffer = new byte[bufferSize];
+            int totalReadCount = 0;
+            int totalBytesReadFromStream = 0;
+            int totalBytesReadSinceLastDot = 0;
+
+            do
+            {
+                totalReadCount = responseStream.Read(buffer, 0, bufferSize);
+                if (totalReadCount != 0)
+                { // zero means EOF
+                  // write buffer into file
+                    destWriter.Write(buffer, 0, totalReadCount);
+                    // increment byte counters
+                    totalBytesReadFromStream += totalReadCount;
+                    totalBytesReadSinceLastDot += totalReadCount;
+                    // display progress
+                    if (Verbose && totalBytesReadSinceLastDot > bufferSize)
+                    {
+                        if (totalBytesReadSinceLastDot == totalBytesReadFromStream)
+                        {
+                            // TO-DO !!!!
+                            //Log.Write(LogPrefix);
+                        }
+                        // TO-DO !!!
+                        //Log.Write(".");
+                        totalBytesReadSinceLastDot = 0;
+                    }
+                }
+            } while (totalReadCount != 0);
+
+            if (totalBytesReadFromStream > bufferSize)
+            {
+                Log(Level.Verbose, "");
+            }
+            Log(Level.Verbose, "Number of bytes read: {0}.",
+                totalBytesReadFromStream.ToString(CultureInfo.InvariantCulture));
+            return totalBytesReadFromStream;
+        }
+
         /// <summary>
         /// This is where the work is done 
         /// </summary>
@@ -220,140 +314,129 @@ namespace NAnt.Core.Tasks {
                         fileTimeStamp.ToString(CultureInfo.InvariantCulture));
                 }
 
-                //set up the URL connection
-                WebRequest webRequest = GetWebRequest(Source, fileTimeStamp);
-                WebResponse webResponse = webRequest.GetResponse();
+                int requestTryCount = 0;
 
-                Stream responseStream = null;
+                for (;;)
+                {
+                    try
+                    {
+                        //set up the URL connection
+                        WebRequest webRequest = GetWebRequest(Source, fileTimeStamp);
+                        WebResponse webResponse = webRequest.GetResponse();
+                        int totalBytesReadFromStream = 0;
 
-                // Get stream
-                // try three times, then error out
-                int tryCount = 1;
+                        using (Stream responseStream = GetResponseStream(webResponse))
+                        using (BinaryWriter destWriter = new BinaryWriter(new FileStream(
+                            DestinationFile.FullName, FileMode.Create)))
+                        {
+                            totalBytesReadFromStream = CopyStream(responseStream, destWriter);
+                        }
 
-                while (true) {
-                    try {
-                        responseStream = webResponse.GetResponseStream();
-                        break;
-                    } catch (IOException ex) {
-                        if (tryCount > 3) {
-                            throw new BuildException(string.Format(CultureInfo.InvariantCulture, 
-                                ResourceUtils.GetString("NA1125"), Source, 
+                        // refresh file info
+                        DestinationFile.Refresh();
+
+                        // check to see if we actually have a file...
+                        if (!DestinationFile.Exists)
+                        {
+                            throw new BuildException(string.Format(CultureInfo.InvariantCulture,
+                                ResourceUtils.GetString("NA1125"), Source,
                                 DestinationFile.FullName), Location);
-                        } else {
-                            Log(Level.Warning, "Unable to open connection to '{0}' (try {1} of 3): " + ex.Message, Source, tryCount);
                         }
-                    }
-                
-                    // increment try count
-                    tryCount++;
-                }
+                        if (webRequest is HttpWebRequest)
+                        {
+                            HttpWebResponse httpResponse = (HttpWebResponse)webResponse;
+                            if (httpResponse.ContentLength == totalBytesReadFromStream)
+                            {
+                                // if (and only if) the use file time option is set, then the
+                                // saved file now has its timestamp set to that of the downloaded file
+                                if (UseTimeStamp)
+                                {
+                                    // get timestamp of remote file
+                                    DateTime remoteTimestamp = httpResponse.LastModified;
 
-                // open file for writing
-                BinaryWriter destWriter = new BinaryWriter(new FileStream(
-                    DestinationFile.FullName, FileMode.Create));
-                
-                Log(Level.Info, "Retrieving '{0}' to '{1}'.", 
-                    Source, DestinationFile.FullName);
+                                    Log(Level.Verbose, "'{0}' last modified on {1}.",
+                                        Source, remoteTimestamp.ToString(CultureInfo.InvariantCulture));
 
-                // Read in stream from URL and write data in chunks
-                // to the dest file.
-                int bufferSize = 100 * 1024;
-                byte[] buffer = new byte[bufferSize];
-                int totalReadCount = 0;
-                int totalBytesReadFromStream = 0;
-                int totalBytesReadSinceLastDot = 0;
-
-                do {
-                    totalReadCount = responseStream.Read(buffer, 0, bufferSize);
-                    if (totalReadCount != 0) { // zero means EOF
-                        // write buffer into file
-                        destWriter.Write(buffer, 0, totalReadCount);
-                        // increment byte counters
-                        totalBytesReadFromStream += totalReadCount;
-                        totalBytesReadSinceLastDot += totalReadCount;
-                        // display progress
-                        if (Verbose && totalBytesReadSinceLastDot > bufferSize) {
-                            if (totalBytesReadSinceLastDot == totalBytesReadFromStream) {
-                                // TO-DO !!!!
-                                //Log.Write(LogPrefix);
+                                    // update timestamp of local file to match that of the 
+                                    // remote file
+                                    TouchFile(DestinationFile, remoteTimestamp);
+                                }
+                                break;
                             }
-                            // TO-DO !!!
-                            //Log.Write(".");
-                            totalBytesReadSinceLastDot = 0;
+
+                            Log(Level.Verbose, "'{0}' download incomplete. Missing {1} bytes.",
+                                Source, httpResponse.ContentLength - totalBytesReadFromStream);
+
+                            ++requestTryCount;
+                            if (requestTryCount == _retries)
+                            {
+                                throw new BuildException(
+                                    string.Format(
+                                        CultureInfo.InvariantCulture,
+                                        ResourceUtils.GetString("NA1125"), Source,
+                                        DestinationFile.FullName),
+                                    Location);
+                            }
+                            // Retry
+                        }
+
+                        break;
+                    }
+                    catch (WebException ex)
+                    {
+                        // If status is WebExceptionStatus.ProtocolError,
+                        //   there has been a protocol error and a WebResponse
+                        //   should exist. Display the protocol error.
+                        if (ex.Status == WebExceptionStatus.ProtocolError)
+                        {
+                            // test for a 304 result (HTTP only)
+                            // Get HttpWebResponse so we can check the HTTP status code
+                            HttpWebResponse httpResponse = (HttpWebResponse)ex.Response;
+                            if (httpResponse.StatusCode == HttpStatusCode.NotModified)
+                            {
+                                //not modified so no file download. just return instead
+                                //and trace out something so the user doesn't think that the
+                                //download happened when it didn't
+
+                                Log(Level.Verbose, "'{0}' not downloaded.  Not modified since {1}.",
+                                    Source, DestinationFile.LastWriteTime.ToString(CultureInfo.InvariantCulture));
+                                return;
+                            }
+                            else
+                            {
+                                ++requestTryCount;
+                                if (requestTryCount == _retries)
+                                {
+                                    throw new BuildException(string.Format(CultureInfo.InvariantCulture,
+                                    ResourceUtils.GetString("NA1125"), Source,
+                                    DestinationFile.FullName), Location, ex);
+                                }
+                            }
+                        }
+                        else
+                        {
+                            ++requestTryCount;
+                            if (requestTryCount == _retries)
+                            {
+                                throw new BuildException(string.Format(CultureInfo.InvariantCulture,
+                                ResourceUtils.GetString("NA1125"), Source, DestinationFile.FullName),
+                                Location, ex);
+                            }
                         }
                     }
-                } while (totalReadCount != 0);
-
-                if (totalBytesReadFromStream > bufferSize) {
-                    Log(Level.Verbose, "");
                 }
-                Log(Level.Verbose, "Number of bytes read: {0}.", 
-                    totalBytesReadFromStream.ToString(CultureInfo.InvariantCulture));
-
-                // clean up response streams
-                destWriter.Close();
-                responseStream.Close();
-
-                // refresh file info
-                DestinationFile.Refresh();
-
-                // check to see if we actually have a file...
-                if(!DestinationFile.Exists) {
-                    throw new BuildException(string.Format(CultureInfo.InvariantCulture, 
-                        ResourceUtils.GetString("NA1125"), Source, 
-                        DestinationFile.FullName), Location);
-                }
-
-                // if (and only if) the use file time option is set, then the
-                // saved file now has its timestamp set to that of the downloaded file
-                if (UseTimeStamp)  {
-                    // HTTP only
-                    if (webRequest is HttpWebRequest) {
-                        HttpWebResponse httpResponse = (HttpWebResponse) webResponse;
-
-                        // get timestamp of remote file
-                        DateTime remoteTimestamp = httpResponse.LastModified;
-
-                        Log(Level.Verbose, "'{0}' last modified on {1}.", 
-                            Source, remoteTimestamp.ToString(CultureInfo.InvariantCulture));
-
-                        // update timestamp of local file to match that of the 
-                        // remote file
-                        TouchFile(DestinationFile, remoteTimestamp);
-                    }
-                }
-            } catch (BuildException) {
+            }
+            catch (BuildException)
+            {
                 // re-throw the exception
                 throw;
-            } catch (WebException ex) {
-                // If status is WebExceptionStatus.ProtocolError,
-                //   there has been a protocol error and a WebResponse
-                //   should exist. Display the protocol error.
-                if (ex.Status == WebExceptionStatus.ProtocolError) {
-                    // test for a 304 result (HTTP only)
-                    // Get HttpWebResponse so we can check the HTTP status code
-                    HttpWebResponse httpResponse = (HttpWebResponse) ex.Response;
-                    if (httpResponse.StatusCode == HttpStatusCode.NotModified) {
-                        //not modified so no file download. just return instead
-                        //and trace out something so the user doesn't think that the
-                        //download happened when it didn't
-
-                        Log(Level.Verbose, "'{0}' not downloaded.  Not modified since {1}.", 
-                            Source, DestinationFile.LastWriteTime.ToString(CultureInfo.InvariantCulture));
-                        return;
-                    } else {
-                        throw new BuildException(string.Format(CultureInfo.InvariantCulture, 
-                            ResourceUtils.GetString("NA1125"), Source, 
-                            DestinationFile.FullName), Location, ex);
-                    }
-                } else {
-                    throw new BuildException(string.Format(CultureInfo.InvariantCulture, 
-                        ResourceUtils.GetString("NA1125"), Source, DestinationFile.FullName), 
-                        Location, ex);
-                }
-            } catch (Exception ex) {
-                throw new BuildException(string.Format(CultureInfo.InvariantCulture, 
-                    ResourceUtils.GetString("NA1125"), Source, DestinationFile.FullName), 
+            }
+            catch (Exception ex)
+            {
+                throw new BuildException(
+                    string.Format(CultureInfo.InvariantCulture,
+                                  ResourceUtils.GetString("NA1125"), Source,
+                                  DestinationFile.FullName),
                     Location, ex);
             }
         }
