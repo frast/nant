@@ -378,6 +378,7 @@ namespace NAnt.Core.Tasks {
                                     Location);
                             }
                             // Retry
+                            continue;
                         }
 
                         break;
